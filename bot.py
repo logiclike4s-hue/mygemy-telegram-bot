@@ -1,0 +1,406 @@
+"""Telegram-бот с поддержкой Google Gemini.
+
+Бот отвечает в личных чатах, а в группах — при обращении по имени/username
+или в ответ на сообщение самого бота.
+"""
+
+import asyncio
+import logging
+import os
+import sqlite3
+import time
+from collections import defaultdict, deque
+from pathlib import Path
+from typing import Deque, Literal
+
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.enums import ChatType
+from aiogram.filters import Command, CommandStart
+from aiogram.enums import ChatMemberStatus
+from aiogram.types import Message
+from dotenv import load_dotenv
+from google import genai
+from google.genai import types
+
+
+load_dotenv(override=True)
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+configured_model = os.getenv("GEMINI_MODEL")
+# Gemini больше не принимает gemini-2.5-flash для новых пользователей.
+GEMINI_MODEL = (
+    "gemini-3.5-flash-lite"
+    if not configured_model or configured_model == "gemini-2.5-flash"
+    else configured_model
+)
+HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "20"))
+MEMORY_DB_PATH = Path(os.getenv("MEMORY_DB_PATH", "bot_memory.sqlite3"))
+
+if not TELEGRAM_BOT_TOKEN:
+    raise RuntimeError("Не задана переменная окружения TELEGRAM_BOT_TOKEN")
+if not GEMINI_API_KEY:
+    raise RuntimeError("Не задана переменная окружения GEMINI_API_KEY")
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+bot = Bot(token=TELEGRAM_BOT_TOKEN)
+dp = Dispatcher()
+router = Router()
+dp.include_router(router)
+
+# История хранится отдельно для каждого чата и ограничивается последними сообщениями.
+chat_histories: dict[int, Deque[types.Content]] = defaultdict(
+    lambda: deque(maxlen=HISTORY_LIMIT)
+)
+group_modes: dict[int, Literal["all", "one"]] = {}
+chat_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+database_lock = asyncio.Lock()
+gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+bot_username: str | None = None
+bot_display_name: str | None = None
+
+
+def initialize_memory() -> None:
+    """Создаёт локальное хранилище памяти и режимов групп."""
+    with sqlite3.connect(MEMORY_DB_PATH) as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chat_memory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                role TEXT NOT NULL CHECK(role IN ('user', 'model')),
+                text TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS group_modes (
+                chat_id INTEGER PRIMARY KEY,
+                mode TEXT NOT NULL CHECK(mode IN ('all', 'one'))
+            )
+            """
+        )
+        connection.commit()
+
+
+def load_chat_history(chat_id: int) -> Deque[types.Content]:
+    """Загружает последние сообщения чата из SQLite."""
+    history: Deque[types.Content] = deque(maxlen=HISTORY_LIMIT)
+    with sqlite3.connect(MEMORY_DB_PATH) as connection:
+        rows = connection.execute(
+            """
+            SELECT role, text FROM chat_memory
+            WHERE chat_id = ?
+            ORDER BY id DESC LIMIT ?
+            """,
+            (chat_id, HISTORY_LIMIT),
+        ).fetchall()
+    for role, text in reversed(rows):
+        history.append(types.Content(role=role, parts=[types.Part(text=text)]))
+    return history
+
+
+def get_group_mode(chat_id: int) -> Literal["all", "one"]:
+    if chat_id not in group_modes:
+        with sqlite3.connect(MEMORY_DB_PATH) as connection:
+            row = connection.execute(
+                "SELECT mode FROM group_modes WHERE chat_id = ?", (chat_id,)
+            ).fetchone()
+        group_modes[chat_id] = row[0] if row else "one"
+    return group_modes[chat_id]
+
+
+async def save_memory(chat_id: int, role: str, text: str) -> None:
+    async with database_lock:
+        await asyncio.to_thread(
+            _save_memory_sync, chat_id, role, text
+        )
+
+
+def _save_memory_sync(chat_id: int, role: str, text: str) -> None:
+    with sqlite3.connect(MEMORY_DB_PATH) as connection:
+        connection.execute(
+            "INSERT INTO chat_memory (chat_id, role, text) VALUES (?, ?, ?)",
+            (chat_id, role, text),
+        )
+        connection.execute(
+            """
+            DELETE FROM chat_memory
+            WHERE chat_id = ? AND id NOT IN (
+                SELECT id FROM chat_memory WHERE chat_id = ?
+                ORDER BY id DESC LIMIT ?
+            )
+            """,
+            (chat_id, chat_id, HISTORY_LIMIT),
+        )
+        connection.commit()
+
+
+async def set_group_mode(chat_id: int, mode: Literal["all", "one"]) -> None:
+    group_modes[chat_id] = mode
+    async with database_lock:
+        await asyncio.to_thread(_set_group_mode_sync, chat_id, mode)
+
+
+def _set_group_mode_sync(chat_id: int, mode: str) -> None:
+    with sqlite3.connect(MEMORY_DB_PATH) as connection:
+        connection.execute(
+            """
+            INSERT INTO group_modes (chat_id, mode) VALUES (?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET mode = excluded.mode
+            """,
+            (chat_id, mode),
+        )
+        connection.commit()
+
+
+def is_private_chat(message: Message) -> bool:
+    """Возвращает True для личного диалога с ботом."""
+    return message.chat.type == ChatType.PRIVATE
+
+
+def was_bot_mentioned(message: Message) -> bool:
+    """Проверяет упоминание бота по username."""
+    text = message.text or message.caption or ""
+    normalized_text = text.casefold()
+    if bot_username and f"@{bot_username.casefold()}" in normalized_text:
+        return True
+    return False
+
+
+def is_reply_to_bot(message: Message) -> bool:
+    """Проверяет, является ли сообщение ответом на сообщение бота."""
+    replied = message.reply_to_message
+    return bool(replied and replied.from_user and replied.from_user.id == bot.id)
+
+
+def clean_prompt(message: Message) -> str:
+    """Убирает username бота из запроса, сохраняя сам вопрос."""
+    text = (message.text or message.caption or "").strip()
+    if bot_username:
+        text = text.replace(f"@{bot_username}", "").replace(
+            f"@{bot_username.casefold()}", ""
+        )
+    return " ".join(text.split()).strip()
+
+
+async def stream_gemini(chat_id: int, prompt: str):
+    """Потоково получает ответ Gemini и возвращает его частями."""
+    if chat_id not in chat_histories:
+        chat_histories[chat_id] = load_chat_history(chat_id)
+    history = chat_histories[chat_id]
+    history.append(types.Content(role="user", parts=[types.Part(text=prompt)]))
+    answer_parts: list[str] = []
+
+    try:
+        stream = await gemini_client.aio.models.generate_content_stream(
+            model=GEMINI_MODEL,
+            contents=list(history),
+            config=types.GenerateContentConfig(
+                system_instruction=(
+                    "Ты полезный Telegram-ассистент. Отвечай на языке пользователя "
+                    "кратко и по существу."
+                )
+            ),
+        )
+        async for response in stream:
+            part = (response.text or "")
+            if part:
+                answer_parts.append(part)
+                yield part
+    except Exception:
+        history.pop()
+        logger.exception("Ошибка при обращении к Gemini")
+        raise
+
+    answer = "".join(answer_parts).strip()
+    if not answer:
+        history.pop()
+        raise RuntimeError("Gemini вернул пустой ответ")
+
+    history.append(types.Content(role="model", parts=[types.Part(text=answer)]))
+    await save_memory(chat_id, "user", prompt)
+    await save_memory(chat_id, "model", answer)
+
+
+async def get_gemini_answer(chat_id: int, prompt: str) -> str:
+    """Запасной непотоковый запрос, если поток Gemini недоступен."""
+    if chat_id not in chat_histories:
+        chat_histories[chat_id] = load_chat_history(chat_id)
+    history = chat_histories[chat_id]
+    history.append(types.Content(role="user", parts=[types.Part(text=prompt)]))
+    try:
+        response = await asyncio.to_thread(
+            gemini_client.models.generate_content,
+            model=GEMINI_MODEL,
+            contents=list(history),
+            config=types.GenerateContentConfig(
+                system_instruction=(
+                    "Ты полезный Telegram-ассистент. Отвечай на языке пользователя "
+                    "кратко и по существу."
+                )
+            ),
+        )
+        answer = (response.text or "").strip()
+        if not answer:
+            raise RuntimeError("Gemini вернул пустой ответ")
+        history.append(types.Content(role="model", parts=[types.Part(text=answer)]))
+        await save_memory(chat_id, "user", prompt)
+        await save_memory(chat_id, "model", answer)
+        return answer
+    except Exception:
+        history.pop()
+        logger.exception("Резервный запрос к Gemini также завершился ошибкой")
+        raise
+
+
+@router.message(CommandStart())
+async def start_handler(message: Message) -> None:
+    if not is_private_chat(message) and not (
+        was_bot_mentioned(message) or is_reply_to_bot(message)
+    ):
+        return
+    await message.reply(
+        "Привет! В группе упомяни меня через @username или ответь на моё "
+        "сообщение."
+    )
+
+
+@router.message(Command("mode"))
+async def mode_handler(message: Message) -> None:
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply("Эта команда работает только в групповом чате.")
+        return
+
+    member = await bot.get_chat_member(message.chat.id, message.from_user.id)
+    if member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR):
+        await message.reply("Переключать режим может только администратор группы.")
+        return
+
+    command_parts = (message.text or "").split()
+    requested_mode = command_parts[1].casefold() if len(command_parts) > 1 else ""
+    if requested_mode not in ("all", "one"):
+        await message.reply(
+            "Использование:\n/mode all — отвечать на все сообщения\n"
+            "/mode one — отвечать только на упоминания и ответы боту"
+        )
+        return
+
+    mode = requested_mode
+    await set_group_mode(message.chat.id, mode)
+    description = (
+        "всем сообщениям" if mode == "all" else "упоминаниям и ответам боту"
+    )
+    await message.reply(f"Режим изменён: отвечаю на {description}.")
+
+
+@router.message()
+async def message_handler(message: Message) -> None:
+    # Один чат обрабатывается последовательно, чтобы ответы и история не смешивались.
+    async with chat_locks[message.chat.id]:
+        await process_message(message)
+
+
+async def process_message(message: Message) -> None:
+    if (
+        not is_private_chat(message)
+        and get_group_mode(message.chat.id) == "one"
+        and not (
+        was_bot_mentioned(message) or is_reply_to_bot(message)
+        )
+    ):
+        return
+
+    prompt = clean_prompt(message)
+    if not prompt:
+        prompt = (
+            f"Пользователь отправил сообщение типа «{message.content_type}» "
+            "без текста. Кратко ответь, что получил это сообщение."
+        )
+
+    response_message: Message | None = None
+    answer_parts: list[str] = []
+    last_edit = 0.0
+    displayed_answer = ""
+    try:
+        await bot.send_chat_action(message.chat.id, "typing")
+        try:
+            async for part in stream_gemini(message.chat.id, prompt):
+                answer_parts.append(part)
+                current_answer = "".join(answer_parts).strip()
+                if response_message is None and current_answer:
+                    response_message = await message.reply(current_answer)
+                    displayed_answer = current_answer
+                    last_edit = time.monotonic()
+                    continue
+
+                # Редактируем не чаще раза в секунду, чтобы не упереться в лимиты Telegram.
+                now = time.monotonic()
+                if (
+                    len(current_answer) <= 4096
+                    and current_answer
+                    and current_answer != displayed_answer
+                    and (not last_edit or now - last_edit >= 0.8)
+                ):
+                    await response_message.edit_text(current_answer)
+                    last_edit = now
+                    displayed_answer = current_answer
+        except Exception:
+            # Повторяем запрос без streaming: ответ будет получен даже при сбое потока.
+            answer_parts = [await get_gemini_answer(message.chat.id, prompt)]
+    except Exception:
+        logger.exception("Не удалось обработать сообщение Telegram")
+        error_text = "Не удалось получить ответ от Gemini. Попробуйте повторить чуть позже."
+        if response_message:
+            try:
+                await response_message.edit_text(error_text)
+            except Exception:
+                logger.exception("Не удалось обновить сообщение об ошибке")
+                await message.reply(error_text)
+        else:
+            await message.reply(error_text)
+        return
+
+    answer = "".join(answer_parts).strip()
+    if len(answer) > 4096:
+        if response_message:
+            await response_message.edit_text(answer[:4096])
+        else:
+            await message.reply(answer[:4096])
+        for offset in range(4096, len(answer), 4096):
+            await message.reply(answer[offset : offset + 4096])
+    elif answer and response_message and answer != displayed_answer:
+        try:
+            await response_message.edit_text(answer)
+        except Exception:
+            # Если Telegram уже содержит такой же текст, ответ всё равно оставлен видимым.
+            logger.exception("Не удалось показать финальный ответ потокового запроса")
+
+
+async def main() -> None:
+    global bot_username, bot_display_name
+    initialize_memory()
+    me = await bot.get_me()
+    bot_username = me.username
+    bot_display_name = me.first_name
+    logger.info("Бот запущен: @%s", bot_username or me.first_name)
+
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Бот остановлен")
