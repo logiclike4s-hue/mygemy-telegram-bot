@@ -1,3 +1,7 @@
 .env
 __pycache__/
 *.py[cod]
+bot.log
+bot-error.log
+bot_memory.sqlite3
+tempCodeRunnerFile.py
