@@ -5,6 +5,7 @@
 """
 
 import asyncio
+import io
 import logging
 import os
 import sqlite3
@@ -34,6 +35,7 @@ GEMINI_MODEL = (
     if not configured_model or configured_model == "gemini-2.5-flash"
     else configured_model
 )
+IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gemini-3.1-flash-image")
 HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "20"))
 MEMORY_DB_PATH = Path(os.getenv("MEMORY_DB_PATH", "bot_memory.sqlite3"))
 
@@ -192,18 +194,69 @@ def clean_prompt(message: Message) -> str:
     return " ".join(text.split()).strip()
 
 
-async def stream_gemini(chat_id: int, prompt: str):
+def should_process_message(message: Message) -> bool:
+    """Проверяет, должен ли бот отвечать на сообщение в текущем режиме."""
+    return is_private_chat(message) or (
+        get_group_mode(message.chat.id) == "all"
+        or was_bot_mentioned(message)
+        or is_reply_to_bot(message)
+    )
+
+
+async def get_attachment(message: Message) -> tuple[types.Part | None, str]:
+    """Скачивает фото, файл или голосовое сообщение для передачи Gemini."""
+    file_id: str | None = None
+    mime_type: str | None = None
+    label = ""
+
+    if message.voice:
+        file_id = message.voice.file_id
+        mime_type = message.voice.mime_type or "audio/ogg"
+        label = "голосовое сообщение"
+    elif message.audio:
+        file_id = message.audio.file_id
+        mime_type = message.audio.mime_type or "audio/mpeg"
+        label = "аудиофайл"
+    elif message.document:
+        file_id = message.document.file_id
+        mime_type = message.document.mime_type or "application/octet-stream"
+        label = f"файл {message.document.file_name or ''}".strip()
+    elif message.photo:
+        file_id = message.photo[-1].file_id
+        mime_type = "image/jpeg"
+        label = "изображение"
+
+    if not file_id or not mime_type:
+        return None, ""
+
+    downloaded = await bot.download(file_id, destination=io.BytesIO())
+    if downloaded is None:
+        raise RuntimeError("Telegram не вернул содержимое вложения")
+    data = downloaded.getvalue()
+    if not data:
+        raise RuntimeError("Вложение оказалось пустым")
+    return types.Part.from_bytes(data=data, mime_type=mime_type), label
+
+
+async def stream_gemini(
+    chat_id: int, prompt: str, attachment: types.Part | None = None
+):
     """Потоково получает ответ Gemini и возвращает его частями."""
     if chat_id not in chat_histories:
         chat_histories[chat_id] = load_chat_history(chat_id)
     history = chat_histories[chat_id]
+    current_parts = [types.Part(text=prompt)]
+    if attachment:
+        current_parts.append(attachment)
     history.append(types.Content(role="user", parts=[types.Part(text=prompt)]))
     answer_parts: list[str] = []
 
     try:
         stream = await gemini_client.aio.models.generate_content_stream(
             model=GEMINI_MODEL,
-            contents=list(history),
+            contents=[*list(history)[:-1], types.Content(
+                role="user", parts=current_parts
+            )],
             config=types.GenerateContentConfig(
                 system_instruction=(
                     "Ты полезный Telegram-ассистент. Отвечай на языке пользователя "
@@ -231,17 +284,24 @@ async def stream_gemini(chat_id: int, prompt: str):
     await save_memory(chat_id, "model", answer)
 
 
-async def get_gemini_answer(chat_id: int, prompt: str) -> str:
+async def get_gemini_answer(
+    chat_id: int, prompt: str, attachment: types.Part | None = None
+) -> str:
     """Запасной непотоковый запрос, если поток Gemini недоступен."""
     if chat_id not in chat_histories:
         chat_histories[chat_id] = load_chat_history(chat_id)
     history = chat_histories[chat_id]
     history.append(types.Content(role="user", parts=[types.Part(text=prompt)]))
+    current_parts = [types.Part(text=prompt)]
+    if attachment:
+        current_parts.append(attachment)
     try:
         response = await asyncio.to_thread(
             gemini_client.models.generate_content,
             model=GEMINI_MODEL,
-            contents=list(history),
+            contents=[*list(history)[:-1], types.Content(
+                role="user", parts=current_parts
+            )],
             config=types.GenerateContentConfig(
                 system_instruction=(
                     "Ты полезный Telegram-ассистент. Отвечай на языке пользователя "
@@ -302,6 +362,51 @@ async def mode_handler(message: Message) -> None:
     await message.reply(f"Режим изменён: отвечаю на {description}.")
 
 
+@router.message(Command("image"))
+async def image_handler(message: Message) -> None:
+    if not should_process_message(message):
+        return
+
+    prompt = (message.text or "").partition(" ")[2].strip()
+    if not prompt:
+        await message.reply("Использование: /image описание изображения")
+        return
+
+    try:
+        await bot.send_chat_action(message.chat.id, "upload_photo")
+        response = await asyncio.to_thread(
+            gemini_client.models.generate_content,
+            model=IMAGE_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_modalities=["TEXT", "IMAGE"],
+            ),
+        )
+        image_part = next(
+            (
+                part
+                for candidate in (response.candidates or [])
+                for part in (candidate.content.parts if candidate.content else [])
+                if part.inline_data and part.inline_data.data
+            ),
+            None,
+        )
+        if image_part is None:
+            raise RuntimeError("Модель не вернула изображение")
+
+        image_bytes = image_part.inline_data.data
+        await message.reply_photo(
+            io.BytesIO(image_bytes),
+            caption=(response.text or "").strip()[:1024] or None,
+        )
+    except Exception:
+        logger.exception("Ошибка генерации изображения")
+        await message.reply(
+            "Не удалось создать изображение. Проверьте IMAGE_MODEL или попробуйте "
+            "другое описание."
+        )
+
+
 @router.message()
 async def message_handler(message: Message) -> None:
     # Один чат обрабатывается последовательно, чтобы ответы и история не смешивались.
@@ -310,30 +415,29 @@ async def message_handler(message: Message) -> None:
 
 
 async def process_message(message: Message) -> None:
-    if (
-        not is_private_chat(message)
-        and get_group_mode(message.chat.id) == "one"
-        and not (
-        was_bot_mentioned(message) or is_reply_to_bot(message)
-        )
-    ):
+    if not should_process_message(message):
         return
 
     prompt = clean_prompt(message)
-    if not prompt:
-        prompt = (
-            f"Пользователь отправил сообщение типа «{message.content_type}» "
-            "без текста. Кратко ответь, что получил это сообщение."
-        )
+    attachment: types.Part | None = None
+    attachment_label = ""
 
     response_message: Message | None = None
     answer_parts: list[str] = []
     last_edit = 0.0
     displayed_answer = ""
     try:
+        attachment, attachment_label = await get_attachment(message)
+        if not prompt:
+            prompt = (
+                f"Пользователь отправил {attachment_label or message.content_type}. "
+                "Проанализируй его и ответь кратко."
+            )
         await bot.send_chat_action(message.chat.id, "typing")
         try:
-            async for part in stream_gemini(message.chat.id, prompt):
+            async for part in stream_gemini(
+                message.chat.id, prompt, attachment
+            ):
                 answer_parts.append(part)
                 current_answer = "".join(answer_parts).strip()
                 if response_message is None and current_answer:
@@ -355,7 +459,9 @@ async def process_message(message: Message) -> None:
                     displayed_answer = current_answer
         except Exception:
             # Повторяем запрос без streaming: ответ будет получен даже при сбое потока.
-            answer_parts = [await get_gemini_answer(message.chat.id, prompt)]
+            answer_parts = [
+                await get_gemini_answer(message.chat.id, prompt, attachment)
+            ]
     except Exception:
         logger.exception("Не удалось обработать сообщение Telegram")
         error_text = "Не удалось получить ответ от Gemini. Попробуйте повторить чуть позже."
