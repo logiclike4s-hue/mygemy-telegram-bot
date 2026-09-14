@@ -399,12 +399,23 @@ async def image_handler(message: Message) -> None:
             io.BytesIO(image_bytes),
             caption=(response.text or "").strip()[:1024] or None,
         )
-    except Exception:
+    except Exception as error:
         logger.exception("Ошибка генерации изображения")
-        await message.reply(
-            "Не удалось создать изображение. Проверьте IMAGE_MODEL или попробуйте "
-            "другое описание."
-        )
+        error_message = "Не удалось создать изображение."
+        response_error = str(error)
+        if "RESOURCE_EXHAUSTED" in response_error or "429" in response_error:
+            error_message = (
+                "Генерация изображения временно недоступна: Gemini API "
+                "вернул 429 — квота для этой модели исчерпана или равна нулю. "
+                "Подключите биллинг/доступную квоту в Google AI Studio и "
+                "повторите команду позже."
+            )
+        elif "NOT_FOUND" in response_error or "404" in response_error:
+            error_message = (
+                f"Модель генерации {IMAGE_MODEL} недоступна для этого API-ключа. "
+                "Укажите доступную IMAGE_MODEL в переменных окружения."
+            )
+        await message.reply(error_message)
 
 
 @router.message()
