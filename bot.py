@@ -5,9 +5,11 @@
 """
 
 import asyncio
+import html
 import io
 import logging
 import os
+import re
 import sqlite3
 import time
 from collections import defaultdict, deque
@@ -259,6 +261,56 @@ def clean_prompt(message: Message) -> str:
             f"@{bot_username.casefold()}", ""
         )
     return " ".join(text.split()).strip()
+
+
+def format_markdown_tables(text: str) -> str:
+    """Преобразует Markdown-таблицы в выровненные HTML-блоки."""
+    lines = text.splitlines()
+    formatted: list[str] = []
+    index = 0
+
+    while index < len(lines):
+        if (
+            index + 1 < len(lines)
+            and "|" in lines[index]
+            and "|" in lines[index + 1]
+            and all(
+                re.fullmatch(r"\s*:?-{3,}:?\s*", cell)
+                for cell in lines[index + 1].strip().strip("|").split("|")
+            )
+        ):
+            table_lines = [lines[index]]
+            index += 1
+            while index < len(lines) and "|" in lines[index]:
+                table_lines.append(lines[index])
+                index += 1
+
+            rows = [
+                [cell.strip() for cell in line.strip().strip("|").split("|")]
+                for line in table_lines
+            ]
+            column_count = max(len(row) for row in rows)
+            rows = [row + [""] * (column_count - len(row)) for row in rows]
+            widths = [
+                max(len(row[column]) for row in rows)
+                for column in range(column_count)
+            ]
+            rendered_rows = [
+                " | ".join(cell.ljust(widths[column]) for column, cell in enumerate(row))
+                for row in rows[:1]
+            ]
+            rendered_rows.append("-+-".join("-" * width for width in widths))
+            rendered_rows.extend(
+                " | ".join(cell.ljust(widths[column]) for column, cell in enumerate(row))
+                for row in rows[2:]
+            )
+            formatted.append("<pre>" + html.escape("\n".join(rendered_rows)) + "</pre>")
+            continue
+
+        formatted.append(html.escape(lines[index]))
+        index += 1
+
+    return "\n".join(formatted)
 
 
 def should_process_message(message: Message) -> bool:
@@ -558,19 +610,29 @@ async def process_message(message: Message) -> None:
     answer = "".join(answer_parts).strip()
     if answer and message.from_user:
         await register_request(message, prompt, answer)
-    if len(answer) > 4096:
+    formatted_answer = format_markdown_tables(answer)
+    if len(formatted_answer) > 4096:
         if response_message:
-            await response_message.edit_text(answer[:4096])
+            await response_message.edit_text(
+                formatted_answer[:4096], parse_mode="HTML"
+            )
         else:
-            await message.reply(answer[:4096])
-        for offset in range(4096, len(answer), 4096):
-            await message.reply(answer[offset : offset + 4096])
-    elif answer and response_message and answer != displayed_answer:
-        try:
-            await response_message.edit_text(answer)
-        except Exception:
-            # Если Telegram уже содержит такой же текст, ответ всё равно оставлен видимым.
-            logger.exception("Не удалось показать финальный ответ потокового запроса")
+            await message.reply(formatted_answer[:4096], parse_mode="HTML")
+        for offset in range(4096, len(formatted_answer), 4096):
+            await message.reply(
+                formatted_answer[offset : offset + 4096], parse_mode="HTML"
+            )
+    elif answer:
+        if response_message and formatted_answer != displayed_answer:
+            try:
+                await response_message.edit_text(
+                    formatted_answer, parse_mode="HTML"
+                )
+            except Exception:
+                # Если Telegram уже содержит такой же текст, ответ всё равно оставлен видимым.
+                logger.exception("Не удалось показать финальный ответ потокового запроса")
+        elif not response_message:
+            await message.reply(formatted_answer, parse_mode="HTML")
 
 
 admin_bot: Bot | None = Bot(token=ADMIN_BOT_TOKEN) if ADMIN_BOT_TOKEN else None
