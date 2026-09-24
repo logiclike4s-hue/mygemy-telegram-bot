@@ -38,6 +38,11 @@ GEMINI_MODEL = (
 IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gemini-3.1-flash-image")
 HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "20"))
 MEMORY_DB_PATH = Path(os.getenv("MEMORY_DB_PATH", "bot_memory.sqlite3"))
+ADMIN_BOT_TOKEN = os.getenv("ADMIN_BOT_TOKEN")
+ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "5955636722"))
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
+INPUT_PRICE_PER_MILLION = float(os.getenv("INPUT_PRICE_PER_MILLION", "0"))
+OUTPUT_PRICE_PER_MILLION = float(os.getenv("OUTPUT_PRICE_PER_MILLION", "0"))
 
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("Не задана переменная окружения TELEGRAM_BOT_TOKEN")
@@ -84,6 +89,19 @@ def initialize_memory() -> None:
         )
         connection.execute(
             """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                requests INTEGER NOT NULL DEFAULT 0,
+                input_chars INTEGER NOT NULL DEFAULT 0,
+                output_chars INTEGER NOT NULL DEFAULT 0,
+                banned INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS group_modes (
                 chat_id INTEGER PRIMARY KEY,
                 mode TEXT NOT NULL CHECK(mode IN ('all', 'one'))
@@ -91,6 +109,55 @@ def initialize_memory() -> None:
             """
         )
         connection.commit()
+
+
+def register_request_sync(message: Message, prompt: str, answer: str) -> None:
+    user = message.from_user
+    if user is None:
+        return
+    with sqlite3.connect(MEMORY_DB_PATH) as connection:
+        connection.execute(
+            """
+            INSERT INTO users (user_id, username, first_name, requests, input_chars, output_chars)
+            VALUES (?, ?, ?, 1, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username = excluded.username,
+                first_name = excluded.first_name,
+                requests = users.requests + 1,
+                input_chars = users.input_chars + excluded.input_chars,
+                output_chars = users.output_chars + excluded.output_chars
+            """,
+            (
+                user.id,
+                user.username,
+                user.first_name,
+                len(prompt),
+                len(answer),
+            ),
+        )
+        connection.commit()
+
+
+async def register_request(message: Message, prompt: str, answer: str) -> None:
+    await asyncio.to_thread(register_request_sync, message, prompt, answer)
+
+
+def is_user_banned(user_id: int) -> bool:
+    with sqlite3.connect(MEMORY_DB_PATH) as connection:
+        row = connection.execute(
+            "SELECT banned FROM users WHERE user_id = ?", (user_id,)
+        ).fetchone()
+    return bool(row and row[0])
+
+
+def estimate_cost(input_chars: int, output_chars: int) -> float:
+    """Грубая оценка: четыре символа считаются одним токеном."""
+    input_tokens = input_chars / 4
+    output_tokens = output_chars / 4
+    return (
+        input_tokens / 1_000_000 * INPUT_PRICE_PER_MILLION
+        + output_tokens / 1_000_000 * OUTPUT_PRICE_PER_MILLION
+    )
 
 
 def load_chat_history(chat_id: int) -> Deque[types.Content]:
@@ -426,6 +493,8 @@ async def message_handler(message: Message) -> None:
 
 
 async def process_message(message: Message) -> None:
+    if message.from_user and is_user_banned(message.from_user.id):
+        return
     if not should_process_message(message):
         return
 
@@ -487,6 +556,8 @@ async def process_message(message: Message) -> None:
         return
 
     answer = "".join(answer_parts).strip()
+    if answer and message.from_user:
+        await register_request(message, prompt, answer)
     if len(answer) > 4096:
         if response_message:
             await response_message.edit_text(answer[:4096])
@@ -502,6 +573,220 @@ async def process_message(message: Message) -> None:
             logger.exception("Не удалось показать финальный ответ потокового запроса")
 
 
+admin_bot: Bot | None = Bot(token=ADMIN_BOT_TOKEN) if ADMIN_BOT_TOKEN else None
+admin_dp = Dispatcher()
+admin_authenticated = False
+pending_ban: tuple[int, int] | None = None
+
+
+def admin_allowed(message: Message) -> bool:
+    return bool(
+        message.from_user
+        and message.from_user.id == ADMIN_USER_ID
+        and admin_authenticated
+    )
+
+
+def find_user_id(identifier: str) -> int | None:
+    value = identifier.strip().lstrip("@").casefold()
+    if value.isdigit():
+        return int(value)
+    with sqlite3.connect(MEMORY_DB_PATH) as connection:
+        row = connection.execute(
+            "SELECT user_id FROM users WHERE lower(username) = ?", (value,)
+        ).fetchone()
+    return int(row[0]) if row else None
+
+
+@admin_dp.message(Command("start"))
+async def admin_start(message: Message) -> None:
+    if message.from_user and message.from_user.id == ADMIN_USER_ID:
+        await message.answer("Введите пароль командой: /login <пароль>")
+    else:
+        await message.answer("Доступ запрещён.")
+
+
+@admin_dp.message(Command("login"))
+async def admin_login(message: Message) -> None:
+    global admin_authenticated
+    if not message.from_user or message.from_user.id != ADMIN_USER_ID:
+        await message.answer("Доступ запрещён.")
+        return
+    if not ADMIN_PASSWORD:
+        await message.answer("ADMIN_PASSWORD не настроен на сервере.")
+        return
+    password = (message.text or "").partition(" ")[2].strip()
+    admin_authenticated = password == ADMIN_PASSWORD
+    await message.answer(
+        "Вход выполнен. Доступны /stats, /top, /ban, /unban и /confirm."
+        if admin_authenticated
+        else "Неверный пароль."
+    )
+
+
+@admin_dp.message(Command("stats"))
+async def admin_stats(message: Message) -> None:
+    if not admin_allowed(message):
+        await message.answer("Сначала выполните /login <пароль>.")
+        return
+    identifier = (message.text or "").partition(" ")[2].strip()
+    with sqlite3.connect(MEMORY_DB_PATH) as connection:
+        if identifier:
+            user_id = find_user_id(identifier)
+            row = connection.execute(
+                "SELECT user_id, username, first_name, requests, input_chars, output_chars, banned "
+                "FROM users WHERE user_id = ?",
+                (user_id or -1,),
+            ).fetchone()
+            if not row:
+                await message.answer("Пользователь не найден.")
+                return
+            await message.answer(
+                f"ID: {row[0]}\nUsername: @{row[1] or '-'}\nИмя: {row[2]}\n"
+                f"Запросов: {row[3]}\nСимволов ввода: {row[4]}\n"
+                f"Символов ответа: {row[5]}\nЗаблокирован: {'да' if row[6] else 'нет'}"
+                f"\nПримерная стоимость: ${estimate_cost(row[4], row[5]):.6f}"
+            )
+            return
+        totals = connection.execute(
+            "SELECT COUNT(*), COALESCE(SUM(requests), 0), COALESCE(SUM(input_chars), 0), "
+            "COALESCE(SUM(output_chars), 0) FROM users"
+        ).fetchone()
+    await message.answer(
+        f"Пользователей: {totals[0]}\nЗапросов: {totals[1]}\n"
+        f"Символов ввода: {totals[2]}\nСимволов ответа: {totals[3]}\n"
+        f"Примерная стоимость: ${estimate_cost(totals[2], totals[3]):.6f}"
+    )
+
+
+@admin_dp.message(Command("top"))
+async def admin_top(message: Message) -> None:
+    if not admin_allowed(message):
+        await message.answer("Сначала выполните /login <пароль>.")
+        return
+    with sqlite3.connect(MEMORY_DB_PATH) as connection:
+        rows = connection.execute(
+            "SELECT username, first_name, requests FROM users ORDER BY requests DESC LIMIT 10"
+        ).fetchall()
+    text = "\n".join(
+        f"{index}. @{username or '-'} ({first_name}) — {requests}"
+        for index, (username, first_name, requests) in enumerate(rows, 1)
+    )
+    await message.answer(text or "Запросов пока нет.")
+
+
+@admin_dp.message(Command("ban"))
+async def admin_ban(message: Message) -> None:
+    global pending_ban
+    if not admin_allowed(message):
+        await message.answer("Сначала выполните /login <пароль>.")
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 3:
+        await message.answer("Использование: /ban <chat_id> <user_id или @username>")
+        return
+    user_id = find_user_id(parts[2])
+    if user_id is None:
+        await message.answer("Пользователь не найден в статистике.")
+        return
+    pending_ban = (int(parts[1]), user_id)
+    await message.answer(
+        f"Подтвердите бан: /confirm\nЧат: {parts[1]}, пользователь: {user_id}"
+    )
+
+
+@admin_dp.message(Command("block"))
+async def admin_block(message: Message) -> None:
+    """Глобально запрещает пользователю обращаться к основному боту."""
+    if not admin_allowed(message):
+        await message.answer("Сначала выполните /login <пароль>.")
+        return
+
+    identifier = (message.text or "").partition(" ")[2].strip()
+    user_id = find_user_id(identifier)
+    if user_id is None:
+        await message.answer(
+            "Пользователь не найден. Он должен хотя бы один раз написать "
+            "основному боту, чтобы появился в статистике."
+        )
+        return
+
+    with sqlite3.connect(MEMORY_DB_PATH) as connection:
+        connection.execute("UPDATE users SET banned = 1 WHERE user_id = ?", (user_id,))
+        connection.commit()
+    await message.answer(
+        f"Пользователь {user_id} заблокирован для личных сообщений боту."
+    )
+
+
+@admin_dp.message(Command("unblock"))
+async def admin_unblock(message: Message) -> None:
+    """Снимает глобальную блокировку пользователя."""
+    if not admin_allowed(message):
+        await message.answer("Сначала выполните /login <пароль>.")
+        return
+
+    identifier = (message.text or "").partition(" ")[2].strip()
+    user_id = find_user_id(identifier)
+    if user_id is None:
+        await message.answer("Пользователь не найден.")
+        return
+
+    with sqlite3.connect(MEMORY_DB_PATH) as connection:
+        connection.execute("UPDATE users SET banned = 0 WHERE user_id = ?", (user_id,))
+        connection.commit()
+    await message.answer(f"Пользователь {user_id} разблокирован.")
+
+
+@admin_dp.message(Command("confirm"))
+async def admin_confirm(message: Message) -> None:
+    global pending_ban
+    if not admin_allowed(message):
+        await message.answer("Сначала выполните /login <пароль>.")
+        return
+    if not pending_ban or not admin_bot:
+        await message.answer("Нет ожидающего действия.")
+        return
+    chat_id, user_id = pending_ban
+    try:
+        await admin_bot.ban_chat_member(chat_id, user_id)
+        with sqlite3.connect(MEMORY_DB_PATH) as connection:
+            connection.execute("UPDATE users SET banned = 1 WHERE user_id = ?", (user_id,))
+            connection.commit()
+        await message.answer(f"Пользователь {user_id} заблокирован.")
+    except Exception:
+        logger.exception("Ошибка бана пользователя")
+        await message.answer("Не удалось заблокировать пользователя.")
+    finally:
+        pending_ban = None
+
+
+@admin_dp.message(Command("unban"))
+async def admin_unban(message: Message) -> None:
+    if not admin_allowed(message):
+        await message.answer("Сначала выполните /login <пароль>.")
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 3:
+        await message.answer("Использование: /unban <chat_id> <user_id>")
+        return
+    user_id = find_user_id(parts[2])
+    if user_id is None:
+        await message.answer("Пользователь не найден.")
+        return
+    if not admin_bot:
+        return
+    try:
+        await admin_bot.unban_chat_member(int(parts[1]), user_id, only_if_banned=True)
+        with sqlite3.connect(MEMORY_DB_PATH) as connection:
+            connection.execute("UPDATE users SET banned = 0 WHERE user_id = ?", (user_id,))
+            connection.commit()
+        await message.answer(f"Пользователь {user_id} разблокирован.")
+    except Exception:
+        logger.exception("Ошибка разбана пользователя")
+        await message.answer("Не удалось разблокировать пользователя.")
+
+
 async def main() -> None:
     global bot_username, bot_display_name
     initialize_memory()
@@ -511,9 +796,14 @@ async def main() -> None:
     logger.info("Бот запущен: @%s", bot_username or me.first_name)
 
     try:
-        await dp.start_polling(bot)
+        polling_tasks = [dp.start_polling(bot)]
+        if admin_bot and ADMIN_PASSWORD:
+            polling_tasks.append(admin_dp.start_polling(admin_bot))
+        await asyncio.gather(*polling_tasks)
     finally:
         await bot.session.close()
+        if admin_bot:
+            await admin_bot.session.close()
 
 
 if __name__ == "__main__":
