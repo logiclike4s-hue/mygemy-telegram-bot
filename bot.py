@@ -16,11 +16,13 @@ from collections import defaultdict, deque
 from pathlib import Path
 from typing import Deque, Literal
 
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ChatType
 from aiogram.filters import Command, CommandStart
 from aiogram.enums import ChatMemberStatus
 from aiogram.types import Message
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
@@ -45,6 +47,8 @@ ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "5955636722"))
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
 INPUT_PRICE_PER_MILLION = float(os.getenv("INPUT_PRICE_PER_MILLION", "0"))
 OUTPUT_PRICE_PER_MILLION = float(os.getenv("OUTPUT_PRICE_PER_MILLION", "0"))
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("Не задана переменная окружения TELEGRAM_BOT_TOKEN")
@@ -849,6 +853,58 @@ async def admin_unban(message: Message) -> None:
         await message.answer("Не удалось разблокировать пользователя.")
 
 
+async def run_webhook() -> None:
+    if not WEBHOOK_SECRET:
+        raise RuntimeError("Не задана переменная окружения WEBHOOK_SECRET")
+
+    webhook_base = RENDER_EXTERNAL_URL
+    await bot.set_webhook(
+        f"{webhook_base}/webhook/main",
+        secret_token=WEBHOOK_SECRET,
+        drop_pending_updates=True,
+    )
+    if admin_bot and ADMIN_PASSWORD:
+        await admin_bot.set_webhook(
+            f"{webhook_base}/webhook/admin",
+            secret_token=WEBHOOK_SECRET,
+            drop_pending_updates=True,
+        )
+
+    async def health_check(_: web.Request) -> web.Response:
+        return web.Response(text="ok")
+
+    app = web.Application()
+    app.router.add_get("/", health_check)
+    SimpleRequestHandler(
+        dispatcher=dp,
+        bot=bot,
+        secret_token=WEBHOOK_SECRET,
+    ).register(app, path="/webhook/main")
+    setup_application(app, dp, bot=bot)
+
+    if admin_bot and ADMIN_PASSWORD:
+        SimpleRequestHandler(
+            dispatcher=admin_dp,
+            bot=admin_bot,
+            secret_token=WEBHOOK_SECRET,
+        ).register(app, path="/webhook/admin")
+        setup_application(app, admin_dp, bot=admin_bot)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", "10000")))
+    await site.start()
+    logger.info("Webhook server started on port %s", os.getenv("PORT", "10000"))
+
+    try:
+        await asyncio.Event().wait()
+    finally:
+        await bot.delete_webhook()
+        if admin_bot:
+            await admin_bot.delete_webhook()
+        await runner.cleanup()
+
+
 async def main() -> None:
     global bot_username, bot_display_name
     initialize_memory()
@@ -858,10 +914,13 @@ async def main() -> None:
     logger.info("Бот запущен: @%s", bot_username or me.first_name)
 
     try:
-        polling_tasks = [dp.start_polling(bot)]
-        if admin_bot and ADMIN_PASSWORD:
-            polling_tasks.append(admin_dp.start_polling(admin_bot))
-        await asyncio.gather(*polling_tasks)
+        if RENDER_EXTERNAL_URL:
+            await run_webhook()
+        else:
+            polling_tasks = [dp.start_polling(bot)]
+            if admin_bot and ADMIN_PASSWORD:
+                polling_tasks.append(admin_dp.start_polling(admin_bot))
+            await asyncio.gather(*polling_tasks)
     finally:
         await bot.session.close()
         if admin_bot:

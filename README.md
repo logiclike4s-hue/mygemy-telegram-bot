@@ -25,6 +25,36 @@
 Ответ Gemini передается потоково: бот начинает показывать текст сразу после
 получения первых фрагментов.
 
+## Запуск на Render
+
+Проект поддерживает Render Web Service через Telegram webhook. Создайте на
+[Render](https://render.com/) новый **Web Service** из этого GitHub-репозитория:
+
+```text
+Build Command: pip install -r requirements.txt
+Start Command: python bot.py
+Plan: Free
+```
+
+Добавьте в Environment следующие переменные:
+
+```env
+TELEGRAM_BOT_TOKEN=...
+GEMINI_API_KEY=...
+ADMIN_BOT_TOKEN=...
+ADMIN_USER_ID=...
+ADMIN_PASSWORD=...
+WEBHOOK_SECRET=случайная_строка_не_короче_16_символов
+```
+
+Render должен передать переменную `RENDER_EXTERNAL_URL` автоматически. Если её
+нет в настройках сервиса, добавьте её вручную в виде URL сервиса, например
+`https://mygemy-bot.onrender.com`. При её наличии бот использует webhook, а без
+неё локально продолжает работать через polling.
+
+Бесплатный сервис Render может засыпать после периода без запросов. Первый
+ответ после пробуждения может прийти с задержкой.
+
 ## Файлы, голос и изображения
 
 В личном чате бот может анализировать фотографии, документы, аудиофайлы и
