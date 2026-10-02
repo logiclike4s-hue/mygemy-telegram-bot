@@ -114,7 +114,35 @@ def normalize_provider(value: str | None) -> str:
 
 
 def get_provider_for_chat(chat_id: int) -> str:
+    initialize_memory()
+    if chat_id not in chat_providers:
+        with sqlite3.connect(MEMORY_DB_PATH) as connection:
+            row = connection.execute(
+                "SELECT provider FROM chat_providers WHERE chat_id = ?",
+                (chat_id,),
+            ).fetchone()
+        chat_providers[chat_id] = normalize_provider(row[0] if row else DEFAULT_PROVIDER)
     return normalize_provider(chat_providers.get(chat_id, DEFAULT_PROVIDER))
+
+
+async def set_provider_for_chat(chat_id: int, provider: str) -> None:
+    initialize_memory()
+    normalized = normalize_provider(provider)
+    chat_providers[chat_id] = normalized
+    async with database_lock:
+        await asyncio.to_thread(_set_provider_for_chat_sync, chat_id, normalized)
+
+
+def _set_provider_for_chat_sync(chat_id: int, provider: str) -> None:
+    with sqlite3.connect(MEMORY_DB_PATH) as connection:
+        connection.execute(
+            """
+            INSERT INTO chat_providers (chat_id, provider) VALUES (?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET provider = excluded.provider
+            """,
+            (chat_id, provider),
+        )
+        connection.commit()
 
 
 def get_model_for_provider(provider: str) -> str:
@@ -225,6 +253,14 @@ def initialize_memory() -> None:
             CREATE TABLE IF NOT EXISTS group_modes (
                 chat_id INTEGER PRIMARY KEY,
                 mode TEXT NOT NULL CHECK(mode IN ('all', 'one'))
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chat_providers (
+                chat_id INTEGER PRIMARY KEY,
+                provider TEXT NOT NULL CHECK(provider IN ('gemini', 'openai', 'deepseek', 'claude'))
             )
             """
         )
@@ -602,7 +638,7 @@ async def model_handler(message: Message) -> None:
         await message.reply("Для Claude нужен ANTHROPIC_API_KEY.")
         return
 
-    chat_providers[message.chat.id] = provider
+    await set_provider_for_chat(message.chat.id, provider)
     await message.reply(f"Провайдер для этого чата установлен: {provider}")
 
 
