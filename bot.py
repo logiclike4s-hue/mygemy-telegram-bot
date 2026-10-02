@@ -27,11 +27,24 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
+try:
+    from openai import OpenAI
+except ImportError:  # pragma: no cover
+    OpenAI = None
+
+try:
+    from anthropic import Anthropic
+except ImportError:  # pragma: no cover
+    Anthropic = None
+
 
 load_dotenv(override=True)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 configured_model = os.getenv("GEMINI_MODEL")
 # Gemini больше не принимает gemini-2.5-flash для новых пользователей.
 GEMINI_MODEL = (
@@ -40,6 +53,10 @@ GEMINI_MODEL = (
     else configured_model
 )
 IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gemini-3.1-flash-image")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-3-5-haiku-latest")
+DEFAULT_PROVIDER = os.getenv("DEFAULT_PROVIDER", "gemini").strip().lower()
 HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "20"))
 MEMORY_DB_PATH = Path(os.getenv("MEMORY_DB_PATH", "bot_memory.sqlite3"))
 ADMIN_BOT_TOKEN = os.getenv("ADMIN_BOT_TOKEN")
@@ -52,7 +69,7 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("Не задана переменная окружения TELEGRAM_BOT_TOKEN")
-if not GEMINI_API_KEY:
+if not GEMINI_API_KEY and DEFAULT_PROVIDER == "gemini":
     raise RuntimeError("Не задана переменная окружения GEMINI_API_KEY")
 
 
@@ -73,10 +90,107 @@ chat_histories: dict[int, Deque[types.Content]] = defaultdict(
 )
 group_modes: dict[int, Literal["all", "one"]] = {}
 chat_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+chat_providers: dict[int, str] = {}
 database_lock = asyncio.Lock()
-gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 bot_username: str | None = None
 bot_display_name: str | None = None
+
+PROVIDER_ALIASES = {
+    "gemini": "gemini",
+    "g": "gemini",
+    "openai": "openai",
+    "chatgpt": "openai",
+    "gpt": "openai",
+    "deepseek": "deepseek",
+    "ds": "deepseek",
+    "claude": "claude",
+    "anthropic": "claude",
+}
+
+
+def normalize_provider(value: str | None) -> str:
+    return PROVIDER_ALIASES.get((value or "").strip().lower(), "gemini")
+
+
+def get_provider_for_chat(chat_id: int) -> str:
+    return normalize_provider(chat_providers.get(chat_id, DEFAULT_PROVIDER))
+
+
+def get_model_for_provider(provider: str) -> str:
+    if provider == "openai":
+        return OPENAI_MODEL
+    if provider == "deepseek":
+        return DEEPSEEK_MODEL
+    if provider == "claude":
+        return CLAUDE_MODEL
+    return GEMINI_MODEL
+
+
+async def call_openai_style(model: str, prompt: str, *, api_key: str, base_url: str | None = None) -> str:
+    if not api_key:
+        raise RuntimeError("API key is missing")
+    if OpenAI is None:
+        raise RuntimeError("openai package is not installed")
+    client = OpenAI(api_key=api_key, base_url=base_url)
+    response = await asyncio.to_thread(
+        client.chat.completions.create,
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.7,
+    )
+    content = response.choices[0].message.content
+    return (content or "").strip()
+
+
+async def call_claude(prompt: str, model: str, *, api_key: str) -> str:
+    if not api_key:
+        raise RuntimeError("API key is missing")
+    if Anthropic is None:
+        raise RuntimeError("anthropic package is not installed")
+    client = Anthropic(api_key=api_key)
+    response = await asyncio.to_thread(
+        client.messages.create,
+        model=model,
+        max_tokens=1024,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    text_parts = []
+    for block in getattr(response, "content", []) or []:
+        if getattr(block, "type", None) == "text":
+            text_parts.append(getattr(block, "text", ""))
+    return "\n".join(text_parts).strip()
+
+
+async def get_provider_answer(chat_id: int, prompt: str, attachment: types.Part | None = None) -> str:
+    provider = get_provider_for_chat(chat_id)
+    if provider == "openai":
+        return await call_openai_style(
+            OPENAI_MODEL,
+            prompt,
+            api_key=OPENAI_API_KEY or "",
+        )
+    if provider == "deepseek":
+        return await call_openai_style(
+            DEEPSEEK_MODEL,
+            prompt,
+            api_key=DEEPSEEK_API_KEY or "",
+            base_url="https://api.deepseek.com",
+        )
+    if provider == "claude":
+        return await call_claude(prompt, CLAUDE_MODEL, api_key=ANTHROPIC_API_KEY or "")
+    return await get_gemini_answer(chat_id, prompt, attachment)
+
+
+async def stream_provider_response(chat_id: int, prompt: str, attachment: types.Part | None = None):
+    provider = get_provider_for_chat(chat_id)
+    if provider == "gemini":
+        async for part in stream_gemini(chat_id, prompt, attachment):
+            yield part
+        return
+    answer = await get_provider_answer(chat_id, prompt, attachment)
+    if answer:
+        yield answer
 
 
 def initialize_memory() -> None:
@@ -457,6 +571,41 @@ async def start_handler(message: Message) -> None:
     )
 
 
+@router.message(Command("model"))
+async def model_handler(message: Message) -> None:
+    parts = (message.text or "").split()
+    if len(parts) == 1:
+        provider = get_provider_for_chat(message.chat.id)
+        await message.reply(
+            "Текущий провайдер: "
+            f"{provider}. Использование: /model gemini | openai | deepseek | claude"
+        )
+        return
+
+    provider = normalize_provider(parts[1])
+    if provider not in ("gemini", "openai", "deepseek", "claude"):
+        await message.reply(
+            "Неверный провайдер. Доступно: gemini, openai, deepseek, claude"
+        )
+        return
+
+    if provider == "gemini" and not GEMINI_API_KEY:
+        await message.reply("Для Gemini нужен GEMINI_API_KEY.")
+        return
+    if provider == "openai" and not OPENAI_API_KEY:
+        await message.reply("Для OpenAI нужен OPENAI_API_KEY.")
+        return
+    if provider == "deepseek" and not DEEPSEEK_API_KEY:
+        await message.reply("Для DeepSeek нужен DEEPSEEK_API_KEY.")
+        return
+    if provider == "claude" and not ANTHROPIC_API_KEY:
+        await message.reply("Для Claude нужен ANTHROPIC_API_KEY.")
+        return
+
+    chat_providers[message.chat.id] = provider
+    await message.reply(f"Провайдер для этого чата установлен: {provider}")
+
+
 @router.message(Command("mode"))
 async def mode_handler(message: Message) -> None:
     if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
@@ -571,7 +720,7 @@ async def process_message(message: Message) -> None:
             )
         await bot.send_chat_action(message.chat.id, "typing")
         try:
-            async for part in stream_gemini(
+            async for part in stream_provider_response(
                 message.chat.id, prompt, attachment
             ):
                 answer_parts.append(part)
@@ -596,11 +745,11 @@ async def process_message(message: Message) -> None:
         except Exception:
             # Повторяем запрос без streaming: ответ будет получен даже при сбое потока.
             answer_parts = [
-                await get_gemini_answer(message.chat.id, prompt, attachment)
+                await get_provider_answer(message.chat.id, prompt, attachment)
             ]
     except Exception:
         logger.exception("Не удалось обработать сообщение Telegram")
-        error_text = "Не удалось получить ответ от Gemini. Попробуйте повторить чуть позже."
+        error_text = "Не удалось получить ответ от выбранного провайдера. Попробуйте повторить чуть позже."
         if response_message:
             try:
                 await response_message.edit_text(error_text)
