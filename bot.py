@@ -195,6 +195,41 @@ def get_model_for_provider(provider: str) -> str:
     return GEMINI_MODEL
 
 
+def describe_provider_error(provider: str, error: Exception) -> str:
+    text = str(error).lower()
+    provider_label = {
+        "openai": "OpenAI",
+        "deepseek": "DeepSeek",
+        "claude": "Claude",
+        "gemini": "Gemini",
+    }.get(provider, provider)
+
+    if "api key" in text or "invalid_api_key" in text or "unauthorized" in text or "401" in text:
+        return (
+            f"Ошибка доступа к {provider_label}: API-ключ невалидный, просрочен или "
+            "не активен. Проверь ключ в переменных окружения."
+        )
+    if "429" in text or "rate limit" in text or "quota" in text or "resource_exhausted" in text:
+        return (
+            f"У {provider_label} закончилась квота или достигнут лимит запросов. "
+            "Подключите оплату/доступ или попробуйте позже."
+        )
+    if "404" in text or "not found" in text or "model_not_found" in text:
+        return (
+            f"Модель для {provider_label} недоступна на этом аккаунте или не поддерживается. "
+            "Проверь имя модели в переменных окружения."
+        )
+    if "insufficient_quota" in text:
+        return (
+            f"Для {provider_label} не подключён платёжный доступ или квота исчерпана."
+        )
+    if "timed out" in text or "timeout" in text or "connection" in text or "network" in text:
+        return f"Сервис {provider_label} сейчас недоступен или отвечает с таймаутом. Попробуйте позже."
+    if "package is not installed" in text:
+        return f"Для {provider_label} не установлена библиотека поддержки API."
+    return f"Не удалось получить ответ от {provider_label}: {error}"
+
+
 async def call_openai_style(model: str, prompt: str, *, api_key: str, base_url: str | None = None) -> str:
     if not api_key:
         raise RuntimeError("API key is missing")
@@ -851,9 +886,10 @@ async def process_message(message: Message) -> None:
             answer_parts = [
                 await get_provider_answer(message.chat.id, prompt, attachment)
             ]
-    except Exception:
+    except Exception as error:
         logger.exception("Не удалось обработать сообщение Telegram")
-        error_text = "Не удалось получить ответ от выбранного провайдера. Попробуйте повторить чуть позже."
+        provider = get_provider_for_chat(message.chat.id)
+        error_text = describe_provider_error(provider, error)
         if response_message:
             try:
                 await response_message.edit_text(error_text)

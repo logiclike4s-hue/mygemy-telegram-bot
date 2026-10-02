@@ -155,7 +155,7 @@ Privacy Mode через `/setprivacy` в @BotFather и выберите `Disable
 
 ```env
 ADMIN_BOT_TOKEN=токен_админ-бота
-ADMIN_USER_ID=5955636722
+ADMIN_USER_ID=ваш-I
 ADMIN_PASSWORD=ваш_пароль
 INPUT_PRICE_PER_MILLION=0
 OUTPUT_PRICE_PER_MILLION=0
