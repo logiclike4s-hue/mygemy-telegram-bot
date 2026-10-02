@@ -107,10 +107,50 @@ PROVIDER_ALIASES = {
     "claude": "claude",
     "anthropic": "claude",
 }
+PREMIUM_PROVIDERS = {"openai", "deepseek", "claude"}
 
 
 def normalize_provider(value: str | None) -> str:
     return PROVIDER_ALIASES.get((value or "").strip().lower(), "gemini")
+
+
+def is_provider_allowed_for_user(user_id: int, provider: str) -> bool:
+    initialize_memory()
+    normalized = normalize_provider(provider)
+    if user_id == ADMIN_USER_ID or normalized == "gemini":
+        return True
+    if normalized not in PREMIUM_PROVIDERS:
+        return True
+    with sqlite3.connect(MEMORY_DB_PATH) as connection:
+        row = connection.execute(
+            "SELECT 1 FROM model_access WHERE user_id = ? AND provider = ? LIMIT 1",
+            (user_id, normalized),
+        ).fetchone()
+    return bool(row)
+
+
+def grant_provider_access(user_id: int, provider: str) -> None:
+    initialize_memory()
+    normalized = normalize_provider(provider)
+    if normalized not in PREMIUM_PROVIDERS:
+        return
+    with sqlite3.connect(MEMORY_DB_PATH) as connection:
+        connection.execute(
+            "INSERT OR IGNORE INTO model_access (user_id, provider) VALUES (?, ?)",
+            (user_id, normalized),
+        )
+        connection.commit()
+
+
+def revoke_provider_access(user_id: int, provider: str) -> None:
+    initialize_memory()
+    normalized = normalize_provider(provider)
+    with sqlite3.connect(MEMORY_DB_PATH) as connection:
+        connection.execute(
+            "DELETE FROM model_access WHERE user_id = ? AND provider = ?",
+            (user_id, normalized),
+        )
+        connection.commit()
 
 
 def get_provider_for_chat(chat_id: int) -> str:
@@ -261,6 +301,15 @@ def initialize_memory() -> None:
             CREATE TABLE IF NOT EXISTS chat_providers (
                 chat_id INTEGER PRIMARY KEY,
                 provider TEXT NOT NULL CHECK(provider IN ('gemini', 'openai', 'deepseek', 'claude'))
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS model_access (
+                user_id INTEGER NOT NULL,
+                provider TEXT NOT NULL CHECK(provider IN ('openai', 'deepseek', 'claude')),
+                PRIMARY KEY (user_id, provider)
             )
             """
         )
@@ -637,6 +686,14 @@ async def model_handler(message: Message) -> None:
     if provider == "claude" and not ANTHROPIC_API_KEY:
         await message.reply("Для Claude нужен ANTHROPIC_API_KEY.")
         return
+    if provider in PREMIUM_PROVIDERS and not is_provider_allowed_for_user(
+        message.from_user.id if message.from_user else -1, provider
+    ):
+        await message.reply(
+            f"У вас нет спец-доступа к модели {provider}. "
+            "Запросите доступ у администратора."
+        )
+        return
 
     await set_provider_for_chat(message.chat.id, provider)
     await message.reply(f"Провайдер для этого чата установлен: {provider}")
@@ -737,6 +794,17 @@ async def process_message(message: Message) -> None:
     if message.from_user and is_user_banned(message.from_user.id):
         return
     if not should_process_message(message):
+        return
+    provider = get_provider_for_chat(message.chat.id)
+    if (
+        message.from_user
+        and provider in PREMIUM_PROVIDERS
+        and not is_provider_allowed_for_user(message.from_user.id, provider)
+    ):
+        await message.reply(
+            f"У вас нет спец-доступа к модели {provider}. "
+            "Запросите доступ у администратора."
+        )
         return
 
     prompt = clean_prompt(message)
@@ -987,6 +1055,48 @@ async def admin_unblock(message: Message) -> None:
         connection.execute("UPDATE users SET banned = 0 WHERE user_id = ?", (user_id,))
         connection.commit()
     await message.answer(f"Пользователь {user_id} разблокирован.")
+
+
+@admin_dp.message(Command("grantmodel"))
+async def admin_grant_model_access(message: Message) -> None:
+    if not admin_allowed(message):
+        await message.answer("Сначала выполните /login <пароль>.")
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 3:
+        await message.answer("Использование: /grantmodel <openai|deepseek|claude> <user_id или @username>")
+        return
+    provider = normalize_provider(parts[1])
+    if provider not in PREMIUM_PROVIDERS:
+        await message.answer("Доступ можно выдать только для openai, deepseek или claude.")
+        return
+    user_id = find_user_id(parts[2])
+    if user_id is None:
+        await message.answer("Пользователь не найден в статистике.")
+        return
+    grant_provider_access(user_id, provider)
+    await message.answer(f"Пользователю {user_id} выдан спец-доступ к {provider}.")
+
+
+@admin_dp.message(Command("revokemodel"))
+async def admin_revoke_model_access(message: Message) -> None:
+    if not admin_allowed(message):
+        await message.answer("Сначала выполните /login <пароль>.")
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 3:
+        await message.answer("Использование: /revokemodel <openai|deepseek|claude> <user_id или @username>")
+        return
+    provider = normalize_provider(parts[1])
+    if provider not in PREMIUM_PROVIDERS:
+        await message.answer("Доступ можно снять только для openai, deepseek или claude.")
+        return
+    user_id = find_user_id(parts[2])
+    if user_id is None:
+        await message.answer("Пользователь не найден в статистике.")
+        return
+    revoke_provider_access(user_id, provider)
+    await message.answer(f"У пользователя {user_id} снят спец-доступ к {provider}.")
 
 
 @admin_dp.message(Command("confirm"))
