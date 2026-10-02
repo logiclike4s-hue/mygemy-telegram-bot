@@ -25,6 +25,37 @@
 Ответ Gemini передается потоково: бот начинает показывать текст сразу после
 получения первых фрагментов.
 
+## Поддерживаемые модели
+
+На текущий момент проект настроен для работы с Google Gemini. В будущем
+планируется расширение под несколько провайдеров:
+
+- Google Gemini
+- OpenAI ChatGPT
+- DeepSeek
+- Anthropic Claude
+
+Для работы с внешними моделями потребуется отдельный ключ API для каждого
+провайдера. Ключи хранятся только в `.env` или в переменных окружения хостинга,
+не в GitHub-репозитории.
+
+### Пример переменных окружения
+
+```env
+TELEGRAM_BOT_TOKEN=...
+GEMINI_API_KEY=...
+OPENAI_API_KEY=...
+DEEPSEEK_API_KEY=...
+ANTHROPIC_API_KEY=...
+
+GEMINI_MODEL=gemini-3.5-flash-lite
+IMAGE_MODEL=gemini-3.1-flash-image
+OPENAI_MODEL=gpt-4o-mini
+DEEPSEEK_MODEL=deepseek-chat
+CLAUDE_MODEL=claude-3-5-haiku-latest
+DEFAULT_PROVIDER=gemini
+```
+
 ## Запуск на Render
 
 Проект поддерживает Render Web Service через Telegram webhook. Создайте на
